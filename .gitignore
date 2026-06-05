@@ -17,3 +17,21 @@ __pycache__/
 *.pyo
 *.pyd
 .pytest_cache/
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Linters / caches
+.mypy_cache/
+.ruff_cache/
+**/__pycache__/**
+
+# Temp files
+*.tmp
+*.swp
+*.swo
