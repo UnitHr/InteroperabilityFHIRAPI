@@ -4,3 +4,16 @@ env/
 venv/
 .env
 env
+
+# Runtime outputs
+cluster_output/
+output_rag/
+llm_output/
+log.out
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
