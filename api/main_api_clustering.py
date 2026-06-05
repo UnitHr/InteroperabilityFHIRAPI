@@ -2,6 +2,16 @@
 
 import math
 import os
+from pathlib import Path
+
+# Load .env from the project root (one level above api/)
+_env_file = Path(__file__).resolve().parents[1] / ".env"
+if _env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file, override=False)
+    except ImportError:
+        pass  # dotenv not installed; rely on environment variables set by the shell
 import json
 import logging
 import logging.config
@@ -45,7 +55,8 @@ except ImportError as e:
     # sys.exit(1)
 
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
+from pydantic import BaseModel
 import uvicorn
 
 LOG_FILE = os.getenv("LOG_FILE", "log.out")
@@ -73,13 +84,18 @@ LOGGING_CONFIG = {
             "mode": "w",
             "encoding": "utf-8",
             "formatter": "default",
-        }
+        },
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.__stdout__",
+            "formatter": "default",
+        },
     },
-    "root": {"handlers": ["file"], "level": "INFO"},
+    "root": {"handlers": ["file", "console"], "level": "INFO"},
     "loggers": {
-        "uvicorn":         {"handlers": ["file"], "level": "INFO", "propagate": False},
-        "uvicorn.error":   {"handlers": ["file"], "level": "INFO", "propagate": False},
-        "uvicorn.access":  {"handlers": ["file"], "level": "INFO", "propagate": False},
+        "uvicorn":         {"handlers": ["file", "console"], "level": "INFO", "propagate": False},
+        "uvicorn.error":   {"handlers": ["file", "console"], "level": "INFO", "propagate": False},
+        "uvicorn.access":  {"handlers": ["file", "console"], "level": "INFO", "propagate": False},
     },
 }
 
@@ -729,10 +745,13 @@ def compute_combined_embedding_for_rag(text, model_general,
 
 def cluster_and_evaluate(attribute_embeddings, max_k: int):
     X = normalize(attribute_embeddings, norm="l2")
-    X = PCA(n_components=min(50, X.shape[1]), random_state=42).fit_transform(X)
+    X = PCA(n_components=min(50, X.shape[0], X.shape[1]), random_state=42).fit_transform(X)
     X = normalize(X, norm="l2")
     clustering_results = []
     min_k = 3
+    n_samples = X.shape[0]
+    # Clamp so no algorithm is asked for more clusters than there are samples.
+    max_k = max(min_k, min(max_k, n_samples - 1))
     if max_k < min_k:
         max_k = min_k
 
@@ -1084,7 +1103,7 @@ def cluster_attributes(attributes, loaded_embedding_models, max_k: int):
             attribute_texts.append(combined_text)
             valid_attributes.append(attr)
         except Exception as e:
-            print(f"Warn: Skip attr {i} text prep: {e}")
+            logging.exception("Skip attr %d text prep: %s", i, e)
     if not attribute_texts:
         return {}, None, {}
     preprocessed_texts = [preprocess_text_dense(text) for text in attribute_texts]
@@ -1871,18 +1890,19 @@ class CombinedRetriever(InMemoryEmbeddingRetriever):
 
 # --- Core Logic Functions ---
 
-def run_clustering_only_pipeline(attribute_path: str, max_k: int, embedding_models_instances: dict):
+def run_clustering_only_pipeline(attribute_data: list, max_k: int, embedding_models_instances: dict):
 
     print(f"Starting clustering pipeline (max_k={max_k})")
-    # ... (checks, load attributes, call cluster_attributes, format results) ...
-    attributes = load_json(attribute_path)
-    print(attributes)
-    if attributes is None: return {"error": f"Failed load: {attribute_path}"}
+    attributes = attribute_data
+    if attributes is None: return {"error": "Attribute data is None"}
     if not isinstance(attributes, list) or not attributes: return {"error": "Attribute data invalid/empty."}
     print(f"Loaded {len(attributes)} attributes.")
     try:
         clusters, model_name, models_info = cluster_attributes(attributes, embedding_models_instances, max_k)
-    except Exception as e: return {"error": f"Clustering error: {e}"}
+    except Exception as e:
+        tb = traceback.format_exc()
+        logging.exception("Clustering pipeline failed")
+        return {"error": f"Clustering error: {e}", "traceback": tb}
     if not clusters: return {"message": "Clustering OK, but no clusters met criteria.", "clusters": {}}
     clusters_dict = {}
     labels_sorted = sorted(clusters.keys())
@@ -2120,19 +2140,17 @@ def to_rank_tuples(ids):
     # Convierte ids ordenados -> lista de tuples para tu RRF actual (score monotónico)
     return [(rid, 1.0/(i+1)) for i, rid in enumerate(ids)]
 
-def run_rag_pipeline(cluster_file_path: str, resource_path: str, json_schemas_path: str, top_k: int, threshold: float):
+def run_rag_pipeline(clusters_data: dict, resource_path: str, json_schemas_path: str, top_k: int, threshold: float):
     """
-    Loads clustered data, resources, schemas, performs RAG retrieval for each cluster,
-    and returns the results matching the expected format.
+    Accepts clustered data directly, loads static resources/schemas from disk, performs RAG
+    retrieval for each cluster, and returns the results matching the expected format.
     """
-    print(f"Starting RAG pipeline: clusters='{cluster_file_path}', resources='{resource_path}', schemas='{json_schemas_path}', top_k={top_k}, threshold={threshold}")
+    print(f"Starting RAG pipeline: resources='{resource_path}', schemas='{json_schemas_path}', top_k={top_k}, threshold={threshold}")
 
-    # ... (1. Load Input Data and Validation remains the same) ...
     print("Loading RAG input data...")
-    clusters_data = load_json(cluster_file_path)
     resources = load_ndjson(resource_path)
     json_schemas = load_ndjson(json_schemas_path)
-    if clusters_data is None: return {"error": f"Failed load cluster data: {cluster_file_path}."}
+    if clusters_data is None: return {"error": "Cluster data is None."}
     if not isinstance(clusters_data, dict): return {"error": "Cluster data not dict."}
     if resources is None: return {"error": f"Failed load resource data: {resource_path}."}
     if not isinstance(resources, list): return {"error": "Resource data not list."}
@@ -2234,8 +2252,9 @@ def run_rag_pipeline(cluster_file_path: str, resource_path: str, json_schemas_pa
         print(f"Wrote {combined_retriever.document_store.count_documents()} documents to store.")
 
     except Exception as e:
-        print(f"ERROR initializing Haystack: {e}\n{traceback.format_exc()}")
-        return {"error": f"Failed Haystack setup: {e}"}
+        tb = traceback.format_exc()
+        logging.exception("ERROR initializing Haystack")
+        return {"error": f"Failed Haystack setup: {e}", "traceback": tb}
 
     # 4. Perform Retrieval for Each Cluster
     print("Performing retrieval...")
@@ -2387,7 +2406,7 @@ def run_rag_pipeline_no_cluster(attributes_file_path: str, resource_path: str, j
         try:
             winner_embedding_config = attributes_data.get("Winner Embedding Config")
             active_models = winner_embedding_config
-        except:
+        except Exception:
             winner_embedding_config = None
             active_models = default_active_models
             
@@ -2431,8 +2450,9 @@ def run_rag_pipeline_no_cluster(attributes_file_path: str, resource_path: str, j
         print(f"Wrote {combined_retriever.document_store.count_documents()} documents to store.")
 
     except Exception as e:
-        print(f"ERROR initializing Haystack: {e}\n{traceback.format_exc()}")
-        return {"error": f"Failed Haystack setup: {e}"}
+        tb = traceback.format_exc()
+        logging.exception("ERROR initializing Haystack")
+        return {"error": f"Failed Haystack setup: {e}", "traceback": tb}
 
     # 4. Perform Retrieval for Each Cluster
     print("Performing retrieval...")
@@ -2651,7 +2671,7 @@ def generate_response_llm(query: str, context: list, json_schemas: list, model_n
     """
     final_response_content = "" # Initialize
     if model_name is None or model_name.strip() == "":
-        model_name = "GPT" # Default to GPT for now
+        model_name = "OpenAI"
     if model_name == "GPT":
         if not AZURE_OPENAI_API_KEY or not GPT4V_ENDPOINT_FHIR:
             raise ValueError("Azure OpenAI API Key or Endpoint not configured for GPT.")
@@ -2851,6 +2871,43 @@ def generate_response_llm(query: str, context: list, json_schemas: list, model_n
         final_response_content = current_response_content
 
 
+    elif model_name == "OpenAI":
+        if not OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY not set — cannot use OpenAI provider.")
+        openai_llm_model = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+        system_prompt = (
+            "You are a domain expert assistant specializing in mapping clinical tabular data to FHIR resources (FHIR R5). "
+            "You have been given information about table attributes (including their names, descriptions, and sample values) "
+            "and your task is to determine the 3 most specific FHIR attributes that best correspond to each table attribute.\n\n"
+            f"The documents you have to consider to answer the query are:\n{context}\n\n"
+            "Based on the provided table attribute information and standard FHIR attribute definitions, determine the top 3 "
+            "most specific FHIR attributes that correspond to each table attribute, listed in order of relevance.\n\n"
+            'Provide your answer as a JSON object with this exact structure:\n'
+            '{"mappings": [{"table_attribute_name": "...", "fhir_attribute_name": ["Res.attr1", "Res.attr2", "Res.attr3"]}, ...]}\n\n'
+            "Rules:\n"
+            "- Return only the JSON object, no commentary.\n"
+            "- Use exactly 3 FHIR attributes per table attribute; use 'No additional attribute found' if fewer than 3 exist.\n"
+            "- Consider attribute name, description, and sample values.\n"
+            "- Use FHIR R5 specification as reference."
+        )
+        openai_client_llm = OpenAI(api_key=OPENAI_API_KEY)
+        try:
+            print(f"Sending request to OpenAI ({openai_llm_model})...")
+            resp = openai_client_llm.chat.completions.create(
+                model=openai_llm_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                temperature=model_temperature,
+                response_format={"type": "json_object"},
+            )
+            final_response_content = resp.choices[0].message.content or ""
+            print(f"OpenAI response received (length {len(final_response_content)}).")
+        except Exception as e:
+            logging.exception("OpenAI LLM call failed")
+            return json.dumps({"error": f"OpenAI call failed: {e}"})
+
     elif model_name == "Llama":
         together_client = Together(api_key=os.environ.get("TOGETHER_API_KEY"))
 
@@ -3044,25 +3101,25 @@ def generate_response_llm(query: str, context: list, json_schemas: list, model_n
 # --- Core Logic Function for LLM Identification ---
 def run_attribute_identification_pipeline(
     llm_provider: str,
-    cluster_file_path: str,
+    clusters_data: dict,
     structured_attributes_path: str,
     resource_path: str,
     schema_path: str,
     temperature: float):
     """
     Runs the LLM-based attribute identification pipeline for all clusters.
+    Accepts cluster+RAG results directly via clusters_data; loads static KB files from disk.
     """
-    print(f"Starting LLM Attribute Identification Pipeline: Provider={llm_provider}, ClusterFile={cluster_file_path}")
+    print(f"Starting LLM Attribute Identification Pipeline: Provider={llm_provider}")
 
     # 1. Load Required Data
     print("Loading data for LLM pipeline...")
-    clusters_data = load_json(cluster_file_path) # Load cluster definitions
     data_structured = load_json(structured_attributes_path) # Load detailed attribute info
     all_resources_data = load_dataset_llm(resource_path) # Load base resources (NDJSON)
     all_schemas_data = load_ndjson(schema_path) # Load schemas (NDJSON)
 
     # --- Data Validation ---
-    if clusters_data is None: return {"error": f"Failed to load cluster data: {cluster_file_path}"}
+    if clusters_data is None: return {"error": "Cluster data is None"}
     if data_structured is None: return {"error": f"Failed to load structured attributes: {structured_attributes_path}"}
     if all_resources_data is None: return {"error": f"Failed to load resources: {resource_path}"}
     if all_schemas_data is None: return {"error": f"Failed to load schemas: {schema_path}"}
@@ -3378,8 +3435,21 @@ def run_attribute_no_cluster_identification_pipeline(
     print("\nLLM Attribute Identification Pipeline finished.")
     return output_data
 
+# --- Request body models ---
+
+class ClusterAttributesBody(BaseModel):
+    attributes: List[dict]
+
+
+class RetrieveResourcesBody(BaseModel):
+    clusters: dict
+
+
+class IdentifyAttributesBody(BaseModel):
+    rag_results: dict
+
+
 # --- FastAPI Application ---
-# (Keep app definition and existing endpoints)
 app = FastAPI(
     title="Attribute Clustering, RAG & LLM Identification API", # Updated title
     description="Runs pipelines for clustering, resource retrieval (RAG), and LLM-based attribute identification.",
@@ -3388,195 +3458,116 @@ app = FastAPI(
 
 # --- API Endpoints ---
 
-@app.get("/cluster-attributes", tags=["Clustering"])
+@app.post("/cluster-attributes", tags=["Clustering"])
 async def cluster_attributes_endpoint(
-    max_k: int = Query(default=40, ge=3, le=50, description="Max number of clusters to explore (inclusive).")
+    body: ClusterAttributesBody,
+    max_k: int = Query(default=40, ge=3, le=50, description="Max number of clusters to explore (inclusive)."),
 ):
-    # (Keep existing /cluster-attributes endpoint code as provided previously)
-    """
-    Triggers the attribute clustering pipeline. Reads attributes, clusters them up to max_k,
-    selects the best, and returns the results. Writes results to a predefined file.
-    """
-    print(OPENAI_API_KEY, nlp, embedding_models_instances) # Debugging line
-    if not all([OPENAI_API_KEY, nlp, embedding_models_instances]): # Basic checks
+    """Trigger attribute clustering. Accepts attribute list in request body."""
+    if not all([OPENAI_API_KEY, nlp, embedding_models_instances]):
         raise HTTPException(status_code=503, detail="Server prerequisites not met (OpenAI Key, SpaCy, Models).")
     try:
-        
-        attribute_path = "data/enriched_attribute_descriptions_SK.json" # Input for clustering
-        # Define the output path where clustering results will be saved (and RAG will read from)
-        cluster_output_path = "cluster_output/clusters_sk_demo.json"
-
-        print(f"Cluster API: Attr Path='{attribute_path}', Output Path='{cluster_output_path}', Max K={max_k}")
-        if not os.path.exists(attribute_path):
-            raise HTTPException(status_code=500, detail=f"Attribute file not found: {attribute_path}")
-
-        # Run clustering
-        results = run_clustering_only_pipeline(attribute_path, max_k,embedding_models_instances)
-
-        if isinstance(results, dict) and "error" in results: raise HTTPException(status_code=500, detail=results["error"])
-        # Save results to file for RAG endpoint to use
-        try:
-            os.makedirs(os.path.dirname(cluster_output_path), exist_ok=True)
-            with open(cluster_output_path, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False, indent=4)
-            print(f"Clustering results saved to: {cluster_output_path}")
-        except Exception as e:
-            print(f"ERROR saving clustering results to {cluster_output_path}: {e}")
-            # Decide if this should be a fatal error for the endpoint
-            raise HTTPException(status_code=500, detail=f"Clustering succeeded, but failed to save results: {e}")
-
+        results = run_clustering_only_pipeline(body.attributes, max_k, embedding_models_instances)
+        if isinstance(results, dict) and "error" in results:
+            tb_snippet = results.get("traceback", "")
+            last_line = tb_snippet.strip().splitlines()[-1] if tb_snippet else ""
+            detail = results["error"] + (f" | {last_line}" if last_line else "")
+            raise HTTPException(status_code=500, detail=detail)
         print("Clustering API request processed successfully.")
-        return results # Also return results directly from API
-
-    except HTTPException as http_exc: raise http_exc
+        return results
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
-        print(f"Unexpected error in /cluster-attributes: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+        logging.exception("Unexpected error in /cluster-attributes")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e} | {traceback.format_exc().strip().splitlines()[-1]}")
 
 
-# NEW: RAG Endpoint
-@app.get("/retrieve-resources", tags=["Retrieval (RAG)"])
+@app.post("/retrieve-resources", tags=["Retrieval (RAG)"])
 async def retrieve_resources_endpoint(
+    body: RetrieveResourcesBody,
     top_k: int = Query(default=5, ge=1, le=50, description="Number of top documents to retrieve per cluster."),
-    threshold: float = Query(default=0.70, ge=0.0, le=1.0, description="Minimum similarity score threshold for retrieved documents.")
+    threshold: float = Query(default=0.70, ge=0.0, le=1.0, description="Minimum similarity score threshold for retrieved documents."),
 ):
-    # (Keep the endpoint logic, ensuring it calls the corrected run_rag_pipeline)
-    """
-    Triggers the RAG pipeline using pre-computed clusters. Reads cluster data, resources, schemas,
-    indexes them using Haystack with a combined embedding model (using text-embedding-3-large),
-    and retrieves the top_k relevant resources for each cluster, filtered by score threshold.
-    Output matches the specified format (attribute dictionary, resources without scores).
-    """
+    """Trigger RAG retrieval. Accepts cluster data in request body."""
     if not all([OPENAI_API_KEY, nlp, embedding_models_instances]):
         raise HTTPException(status_code=503, detail="Server prerequisites not met.")
     try:
-        cluster_file_path = "cluster_output/clusters_sk_demo.json"
         resource_path = "data/datasetRecursosBase.ndjson"
         json_schemas_path = "data/enriched_dataset_schemasBase.ndjson"
-        print(f"RAG API triggered: K={top_k}, Threshold={threshold}")
+        if not os.path.exists(resource_path):
+            raise HTTPException(status_code=500, detail=f"Resource file missing: {resource_path}")
+        if not os.path.exists(json_schemas_path):
+            raise HTTPException(status_code=500, detail=f"Schema file missing: {json_schemas_path}")
 
-        # --- File existence checks ---
-        if not os.path.exists(cluster_file_path): raise HTTPException(status_code=404, detail=f"Cluster file missing: {cluster_file_path}. Run /cluster-attributes first.")
-        if not os.path.exists(resource_path): raise HTTPException(status_code=500, detail=f"Resource file missing: {resource_path}")
-        if not os.path.exists(json_schemas_path): raise HTTPException(status_code=500, detail=f"Schema file missing: {json_schemas_path}")
-
-        results = run_rag_pipeline(cluster_file_path, resource_path, json_schemas_path, top_k, threshold)
-
-        if isinstance(results, dict) and "error" in results: raise HTTPException(status_code=500, detail=results["error"])
-
-        # Optional: Save RAG results to file
-        rag_output_path = "output_rag/clusters_rag_sk_demo.json" # New name
-        try:
-            os.makedirs(os.path.dirname(rag_output_path), exist_ok=True)
-            with open(rag_output_path, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
-            print(f"RAG results saved: {rag_output_path}")
-        except Exception as e: print(f"Warn: Failed save RAG results: {e}") # Non-fatal
-
+        results = run_rag_pipeline(body.clusters, resource_path, json_schemas_path, top_k, threshold)
+        if isinstance(results, dict) and "error" in results:
+            tb_snippet = results.get("traceback", "")
+            last_line = tb_snippet.strip().splitlines()[-1] if tb_snippet else ""
+            detail = results["error"] + (f" | {last_line}" if last_line else "")
+            raise HTTPException(status_code=500, detail=detail)
         print("RAG API request processed successfully.")
         return results
-
-    except HTTPException as http_exc: raise http_exc
+    except HTTPException as http_exc:
+        raise http_exc
     except Exception as e:
-        print(f"Unexpected error in /retrieve-resources: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Internal server error during RAG: {str(e)}")
+        logging.exception("Unexpected error in /retrieve-resources")
+        raise HTTPException(status_code=500, detail=f"Internal server error during RAG: {str(e)} | {traceback.format_exc().strip().splitlines()[-1]}")
 
-@app.get("/identify-attributes-llm", tags=["LLM Identification"])
+@app.post("/identify-attributes-llm", tags=["LLM Identification"])
 async def identify_attributes_llm_endpoint(
-    llm_provider: str = Query(default="GPT", description="LLM provider to use ('GPT' for Azure, 'Llama' for Together)."),
+    body: IdentifyAttributesBody,
+    llm_provider: str = Query(default="OpenAI", description="LLM provider: 'OpenAI' (api.openai.com), 'GPT' (Azure), 'Llama' (Together)."),
     num_exec: int = Query(default=1, description="Number of executions of the experiment."),
     temperature: float = Query(default=1.0, ge=0.0, le=2.0, description="Temperature setting for LLM generation."),
-    #cluster_file_name: str = Query(default="only_clusters_resQ_sk.json", description="Filename of the cluster results JSON within 'data/'.")
 ):
-    """
-    Triggers the LLM-based attribute identification pipeline.
-
-    Reads cluster data, structured attributes, resources, and schemas from predefined paths.
-    For each cluster, it constructs a prompt with attribute details and context from relevant resources/schemas,
-    then calls the specified LLM provider (Azure GPT or Together Llama) to generate FHIR attribute mappings.
-    """
-    #print(f"LLM Identification API triggered: Provider={llm_provider}, Iterations={iterations}, ClusterFile={cluster_file_name}")
-
-    # --- Prerequisite Checks ---
-    print(AZURE_OPENAI_API_KEY, GPT4V_ENDPOINT_FHIR) # Debugging line
-    if (not AZURE_OPENAI_API_KEY or not GPT4V_ENDPOINT_FHIR):
-         raise HTTPException(status_code=503, detail="Azure OpenAI API Key or Endpoint not configured for GPT provider.")
-    #if llm_provider == "Llama" and not together_client: # Check if client initialized
-    #    raise HTTPException(status_code=503, detail="Together AI API Key not configured or client failed to initialize for Llama provider.")
+    """Trigger LLM attribute identification. Accepts RAG results (cluster+candidates) in request body."""
+    if llm_provider == "GPT" and (not AZURE_OPENAI_API_KEY or not GPT4V_ENDPOINT_FHIR):
+        raise HTTPException(status_code=503, detail="Azure OpenAI API Key or Endpoint not configured for GPT provider.")
+    if llm_provider == "OpenAI" and not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured for OpenAI provider.")
     if not nlp:
-         raise HTTPException(status_code=503, detail="Server configuration error: SpaCy model failed to load.")
-    # Add checks for other necessary components if needed
+        raise HTTPException(status_code=503, detail="Server configuration error: SpaCy model failed to load.")
 
-    # --- Define File Paths ---
-    base_data_path = "data/"
-    base_output_rag_path = "output_rag/"
-    base_output_path = "/output"
-    llm_output_base = "llm_output/" # Separate output dir for LLM results
-    cluster_file_name = "clusters_rag_sk_demo.json"
-    cluster_file_path = os.path.join(base_output_rag_path, cluster_file_name)
-    # Path to the structured attributes file used by the script
-    structured_attributes_path = "data/filtered_data_attributes.json" # Based on script variable 'path' + 'filename'
-    resource_path = os.path.join(base_data_path, "datasetRecursosBase.ndjson") # Based on script
-    schema_path = os.path.join(base_data_path, "enriched_dataset_schemasBase.ndjson") # Based on script
+    structured_attributes_path = "data/filtered_data_attributes.json"
+    resource_path = "data/datasetRecursosBase.ndjson"
+    schema_path = "data/enriched_dataset_schemasBase.ndjson"
 
+    for name, path in [
+        ("Structured Attributes", structured_attributes_path),
+        ("Resources", resource_path),
+        ("Schemas", schema_path),
+    ]:
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail=f"{name} file not found at expected path: {path}")
 
-    # --- File Existence Checks ---
-    required_files = {
-        "Cluster File": cluster_file_path,
-        "Structured Attributes": structured_attributes_path,
-        "Resources": resource_path,
-        "Schemas": schema_path
-    }
-    for name, path in required_files.items():
-         if not os.path.exists(path):
-              raise HTTPException(status_code=404, detail=f"{name} file not found at expected path: {path}")
-
-    # --- Run Pipeline ---
-    
     list_results = []
     for i in range(num_exec):
         print(f"LLM Identification Execution {i}/{num_exec} started.")
         try:
             results = run_attribute_identification_pipeline(
                 llm_provider=llm_provider,
-                cluster_file_path=cluster_file_path,
+                clusters_data=body.rag_results,
                 structured_attributes_path=structured_attributes_path,
                 resource_path=resource_path,
                 schema_path=schema_path,
-                temperature=temperature
+                temperature=temperature,
             )
-
             if isinstance(results, dict) and "error" in results:
-                # Pipeline itself reported an error (e.g., loading failed)
-                raise HTTPException(status_code=500, detail=f"Pipeline error: {results['error']}")
-
-            # --- Optional: Save results to file --
-            output_filename = f"Slovak/{llm_provider}_llm_results_iter_{i}_temp_{temperature}_{cluster_file_name}"
-            output_path = os.path.join(llm_output_base, output_filename)
-            try:
-                os.makedirs(llm_output_base, exist_ok=True)
-                with open(output_path, "w", encoding="utf-8") as f:
-                    # Results should be a list of dicts here
-                    json.dump(results, f, ensure_ascii=False, indent=4)
-                print(f"LLM identification results saved to: {output_path}")
-            except Exception as e:
-                print(f"Warning: Failed to save LLM results to {output_path}: {e}")
-                # Do not fail the request if saving fails
-
+                tb_snippet = results.get("traceback", "")
+                last_line = tb_snippet.strip().splitlines()[-1] if tb_snippet else ""
+                detail = f"Pipeline error: {results['error']}" + (f" | {last_line}" if last_line else "")
+                raise HTTPException(status_code=500, detail=detail)
             print("LLM Identification API request processed successfully.")
-            list_results.append(results) # Append the results to the list
-
+            list_results.append(results)
         except HTTPException as http_exc:
-            raise http_exc # Re-raise specific HTTP exceptions
-        except ValueError as ve: # Catch config errors etc.
-            print(f"Configuration or Value Error: {ve}")
+            raise http_exc
+        except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            print(f"An unexpected error occurred in the LLM endpoint: {e}")
-            print(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=f"Internal server error during LLM identification: {str(e)}")
+            logging.exception("Unexpected error in /identify-attributes-llm")
+            raise HTTPException(status_code=500, detail=f"Internal server error during LLM identification: {str(e)} | {traceback.format_exc().strip().splitlines()[-1]}")
 
-    return list_results if num_exec > 1 else list_results[0] # Return single result directly if only one execution
+    return list_results if num_exec > 1 else list_results[0]
 
 @app.get("/identify-attributes-llm-no-clusters", tags=["LLM Identification"])
 async def identify_attributes_llm_endpoint_no_clusters(
