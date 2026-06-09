@@ -21,6 +21,7 @@ import time
 from typing import Dict, List
 import numpy as np
 from collections import defaultdict, Counter
+from contextlib import asynccontextmanager
 from functools import wraps
 import spacy
 import nltk
@@ -2140,6 +2141,55 @@ def to_rank_tuples(ids):
     # Convierte ids ordenados -> lista de tuples para tu RRF actual (score monotónico)
     return [(rid, 1.0/(i+1)) for i, rid in enumerate(ids)]
 
+
+# ---------------------------------------------------------------------------
+# RAG Index Cache — built once per (resource_path, schemas_path, models) key
+# ---------------------------------------------------------------------------
+_RAG_INDEX_CACHE: dict = {}
+
+
+def _build_rag_index(resource_path: str, json_schemas_path: str, active_models: list) -> tuple:
+    resources = load_ndjson(resource_path)
+    json_schemas = load_ndjson(json_schemas_path)
+    if not resources or not isinstance(resources, list):
+        raise RuntimeError(f"Failed to load resources from {resource_path}")
+    if not json_schemas or not isinstance(json_schemas, list):
+        raise RuntimeError(f"Failed to load schemas from {json_schemas_path}")
+    passages = create_passages(resources, json_schemas)
+    if not passages:
+        raise RuntimeError("Failed to create passages from resources")
+    passages_preprocessed = {rid: preprocess_text_dense(txt) for rid, txt in passages.items()}
+    document_store = InMemoryDocumentStore(embedding_similarity_function="cosine")
+    combined_retriever = CombinedRetriever(
+        document_store=document_store,
+        model_general=embedding_models_instances["general"],
+        model_general2=embedding_models_instances["general2"],
+        model_medico=embedding_models_instances["medico"],
+        model_medico2=embedding_models_instances["medico2"],
+        model_biobert=embedding_models_instances["biobert"],
+        model_gemma=embedding_models_instances["gemma"],
+        modern_medico=embedding_models_instances["modern_medico"],
+        active_models=active_models,
+    )
+    resource_cards = make_resource_cards(passages, max_words=180)
+    haystack_docs = create_documents_from_passages_with_token_chunks(passages_preprocessed, combined_retriever, 256, 32)
+    if not haystack_docs:
+        raise RuntimeError("Failed to create document chunks")
+    doc_embeddings = combined_retriever.embed_documents(haystack_docs)
+    for doc, emb in zip(haystack_docs, doc_embeddings):
+        doc.embedding = emb
+    combined_retriever.document_store.write_documents(haystack_docs)
+    print(f"RAG index ready: {combined_retriever.document_store.count_documents()} docs, models={active_models}")
+    return document_store, combined_retriever, resource_cards
+
+
+def _get_rag_index(resource_path: str, json_schemas_path: str, active_models: list) -> tuple:
+    key = (resource_path, json_schemas_path, tuple(sorted(active_models)))
+    if key not in _RAG_INDEX_CACHE:
+        _RAG_INDEX_CACHE[key] = _build_rag_index(resource_path, json_schemas_path, active_models)
+    return _RAG_INDEX_CACHE[key]
+
+
 def run_rag_pipeline(clusters_data: dict, resource_path: str, json_schemas_path: str, top_k: int, threshold: float):
     """
     Accepts clustered data directly, loads static resources/schemas from disk, performs RAG
@@ -2147,110 +2197,28 @@ def run_rag_pipeline(clusters_data: dict, resource_path: str, json_schemas_path:
     """
     print(f"Starting RAG pipeline: resources='{resource_path}', schemas='{json_schemas_path}', top_k={top_k}, threshold={threshold}")
 
-    print("Loading RAG input data...")
-    resources = load_ndjson(resource_path)
-    json_schemas = load_ndjson(json_schemas_path)
     if clusters_data is None: return {"error": "Cluster data is None."}
     if not isinstance(clusters_data, dict): return {"error": "Cluster data not dict."}
-    if resources is None: return {"error": f"Failed load resource data: {resource_path}."}
-    if not isinstance(resources, list): return {"error": "Resource data not list."}
-    if json_schemas is None: return {"error": f"Failed load schema data: {json_schemas_path}."}
-    if not isinstance(json_schemas, list): return {"error": "Schema data not list."}
-    print(f"Loaded data.")
 
+    _CONFIG_TO_ACTIVE_MODELS = {
+        "general_only": ["general"],
+        "general2_only": ["general2"],
+        "medico_only": ["medico"],
+        "biobert_only": ["biobert"],
+        "gemma_only": ["gemma"],
+        "medico2_only": ["medico2"],
+        "modern_medico_only": ["modern_medico"],
+    }
+    winner_embedding_config = clusters_data.get("Winner Embedding Config")
+    active_models = (
+        _CONFIG_TO_ACTIVE_MODELS.get(winner_embedding_config, ["medico2"])
+        if isinstance(winner_embedding_config, str)
+        else ["medico2"]
+    )
+    print(f"Active models for RAG: {active_models}")
 
-
-
-    # ... (2. Prepare Documents for Haystack remains the same) ...
-    print("Creating passages and documents...")
-    passages = create_passages(resources, json_schemas)
-    passages_preprocessed = {rid: preprocess_text_dense(txt) for rid, txt in passages.items()}
-    if not passages: return {"error": "Failed to create passages."}
-    #haystack_docs_processed = create_documents_from_passages_with_chunks(passages)
-
-    # 3. Initialize Haystack Components
-    print("Initializing Haystack...")
     try:
-        document_store = InMemoryDocumentStore(
-            embedding_similarity_function="cosine",
-        )
-
-        default_active_models = ["medico2"]
-
-        winner_embedding_config = clusters_data.get("Winner Embedding Config")
-        embedding_config_info = clusters_data.get("Embedding Config Info", {})
-        print(f"Winner Embedding Config: {winner_embedding_config}, info: {embedding_config_info}")
-        # Mapear nombre de modelo ganador -> lista de modelos activos para el CombinedRetriever
-        CONFIG_TO_ACTIVE_MODELS = {
-            "general_only":             ["general"],
-            "general2_only":            ["general2"],
-            "medico_only":              ["medico"],
-            # "openai_only":            ["openai"],
-            "biobert_only":             ["biobert"],
-            "gemma_only":               ["gemma"],
-            "medico2_only":            ["medico2"],
-            "modern_medico_only":      ["modern_medico"],
-
-            # "general+medico":           ["general", "medico"],
-            # "general2+medico":          ["general2", "medico"],
-            # "general+medico+gemma":     ["general", "medico", "gemma"],
-
-            # "medico+biobert":           ["medico", "biobert"],
-            # "medico+gemma":             ["medico", "gemma"],
-            # "medico+biobert+gemma":     ["medico", "biobert", "gemma"],
-
-            # "general+biobert":          ["general", "biobert"],
-            # "general+biobert+gemma":    ["general", "biobert", "gemma"],
-            # "general2+biobert":         ["general2", "biobert"],
-            # "general2+biobert+gemma":   ["general2", "biobert", "gemma"],
-            # "general+medico+biobert":   ["general", "medico", "biobert"],
-
-            # "all_models_with_biobert":  ["general", 
-            #                              "general2",
-            #                              "medico", "biobert", "gemma"],
-        }
-
-
-        winner_model = True
-        if isinstance(winner_embedding_config, str) and winner_model:
-            active_models = CONFIG_TO_ACTIVE_MODELS.get(
-                winner_embedding_config,
-                default_active_models
-            )
-        else:
-            # Si no viene la clave o no es str, usamos todos por defecto
-            active_models = default_active_models
-
-    
-        print(f"Active models for RAG: {active_models}")
-
-
-        # --- 3.3. Crear el CombinedRetriever una sola vez ---
-        combined_retriever = CombinedRetriever(
-            document_store=document_store,
-            model_general=embedding_models_instances["general"],
-            model_general2=embedding_models_instances["general2"],
-            model_medico=embedding_models_instances["medico"],
-            model_medico2=embedding_models_instances["medico2"],
-            model_biobert=embedding_models_instances["biobert"],
-            model_gemma=embedding_models_instances["gemma"],
-            modern_medico=embedding_models_instances["modern_medico"],
-            active_models=active_models,
-        )
-        resource_cards = make_resource_cards(passages, max_words=180)
-        haystack_docs_processed = create_documents_from_passages_with_token_chunks(passages_preprocessed,combined_retriever,256,32)
-        print(haystack_docs_processed)
-        if not haystack_docs_processed: return {"error": "Failed to create document chunks."}
-
-                   # --- 3.4. Embedder documentos y escribir en el DocumentStore ---
-        doc_embeddings = combined_retriever.embed_documents(haystack_docs_processed)
-
-        for doc, emb in zip(haystack_docs_processed, doc_embeddings):
-            doc.embedding = emb
-
-        combined_retriever.document_store.write_documents(haystack_docs_processed)
-        print(f"Wrote {combined_retriever.document_store.count_documents()} documents to store.")
-
+        _, combined_retriever, resource_cards = _get_rag_index(resource_path, json_schemas_path, active_models)
     except Exception as e:
         tb = traceback.format_exc()
         logging.exception("ERROR initializing Haystack")
@@ -2273,7 +2241,6 @@ def run_rag_pipeline(clusters_data: dict, resource_path: str, json_schemas_path:
         # Construct query from the values (descriptions) in the cluster_content dict
         print("Constructing query from cluster attributes...")
 
-        resource_text_by_id = passages
         query_parts = [f"Attribute: {name}. Description: {desc}." for name, desc in cluster_content.items()]
         cluster_query_text = " ".join(query_parts)
         print(cluster_query_text)
@@ -2357,98 +2324,15 @@ def run_rag_pipeline_no_cluster(attributes_file_path: str, resource_path: str, j
     Loads clustered data, resources, schemas, performs RAG retrieval for each cluster,
     and returns the results matching the expected format.
     """
-    print(f"Starting RAG pipeline: clusters='{attributes_file_path}', resources='{resource_path}', schemas='{json_schemas_path}', top_k={top_k}, threshold={threshold}")
+    print(f"Starting RAG pipeline (no cluster): attributes='{attributes_file_path}', top_k={top_k}, threshold={threshold}")
 
-    # ... (1. Load Input Data and Validation remains the same) ...
-    print("Loading RAG input data...")
+    print("Loading attributes data...")
     attributes_data = load_json(attributes_file_path)
-    resources = load_ndjson(resource_path)
-    json_schemas = load_ndjson(json_schemas_path)
     if attributes_data is None: return {"error": f"Failed load attributes data: {attributes_file_path}."}
     if not isinstance(attributes_data, list): return {"error": "Attributes data not list."}
-    if resources is None: return {"error": f"Failed load resource data: {resource_path}."}
-    if not isinstance(resources, list): return {"error": "Resource data not list."}
-    if json_schemas is None: return {"error": f"Failed load schema data: {json_schemas_path}."}
-    if not isinstance(json_schemas, list): return {"error": "Schema data not list."}
-    print(f"Loaded data.")
 
-
-
-
-    # ... (2. Prepare Documents for Haystack remains the same) ...
-    print("Creating passages and documents...")
-    passages = create_passages(resources, json_schemas)
-    passages_preprocessed = {rid: preprocess_text_dense(txt) for rid, txt in passages.items()}
-    if not passages: return {"error": "Failed to create passages."}
-
-    # 3. Initialize Haystack Components
-    print("Initializing Haystack...")
     try:
-        document_store = InMemoryDocumentStore(
-            embedding_similarity_function="cosine",
-        )
-
-        default_active_models = ["medico2"]
-        
-
-        # Mapear nombre de modelo ganador -> lista de modelos activos para el CombinedRetriever
-        CONFIG_TO_ACTIVE_MODELS = {
-            "general_only":             ["general"],
-            "general2_only":            ["general2"],
-            "medico_only":              ["medico"],
-            # "openai_only":            ["openai"],
-            "biobert_only":             ["biobert"],
-            "gemma_only":               ["gemma"],
-            "medico2_only":            ["medico2"],
-            "modern_medico_only":      ["modern_medico"],
-        }
-
-        try:
-            winner_embedding_config = attributes_data.get("Winner Embedding Config")
-            active_models = winner_embedding_config
-        except Exception:
-            winner_embedding_config = None
-            active_models = default_active_models
-            
-        print(f"Winner Embedding Config: {active_models}")
-
-        if isinstance(active_models, str):
-            active_models = CONFIG_TO_ACTIVE_MODELS.get(
-                active_models,
-                default_active_models
-            )
-        else:
-            active_models = default_active_models
-
-        print(f"Active models for RAG: {active_models}")
-
-
-        # --- 3.3. Crear el CombinedRetriever una sola vez ---
-        combined_retriever = CombinedRetriever(
-            document_store=document_store,
-            model_general=embedding_models_instances["general"],
-            model_general2=embedding_models_instances["general2"],
-            model_medico=embedding_models_instances["medico"],
-            model_medico2=embedding_models_instances["medico2"],
-            model_biobert=embedding_models_instances["biobert"],
-            model_gemma=embedding_models_instances["gemma"],
-            modern_medico=embedding_models_instances["modern_medico"],
-            active_models=active_models,
-        )
-        resource_cards = make_resource_cards(passages, max_words=180)
-        haystack_docs_processed = create_documents_from_passages_with_token_chunks(passages_preprocessed,combined_retriever,256,32)
-        print(haystack_docs_processed)
-        if not haystack_docs_processed: return {"error": "Failed to create document chunks."}
-
-                   # --- 3.4. Embedder documentos y escribir en el DocumentStore ---
-        doc_embeddings = combined_retriever.embed_documents(haystack_docs_processed)
-
-        for doc, emb in zip(haystack_docs_processed, doc_embeddings):
-            doc.embedding = emb
-
-        combined_retriever.document_store.write_documents(haystack_docs_processed)
-        print(f"Wrote {combined_retriever.document_store.count_documents()} documents to store.")
-
+        _, combined_retriever, resource_cards = _get_rag_index(resource_path, json_schemas_path, ["medico2"])
     except Exception as e:
         tb = traceback.format_exc()
         logging.exception("ERROR initializing Haystack")
@@ -2787,7 +2671,6 @@ def generate_response_llm(query: str, context: list, json_schemas: list, model_n
              current_response_content = json.dumps({"error": "Could not extract response content."}) # Default error JSON
 
         print(f"Initial GPT response received (length {len(current_response_content)}).")
-        time.sleep(30) # Reduced sleep time
 
         # --- Reflection Loop (GPT Only) ---
         for i in range(iterations):
@@ -2865,8 +2748,6 @@ def generate_response_llm(query: str, context: list, json_schemas: list, model_n
             else:
                  print(f"Reflection {i+1} did not yield significant changes or failed extraction.")
                  # Optionally break early if no changes or errors occurred
-
-            time.sleep(30) # Reduced sleep time
 
         final_response_content = current_response_content
 
@@ -3081,8 +2962,6 @@ def generate_response_llm(query: str, context: list, json_schemas: list, model_n
                 else:
                     print(f"Reflection {i+1} did not yield significant changes or failed extraction.")
                  # Optionally break early if no changes or errors occurred
-
-                time.sleep(30) # Reduced sleep time
 
             final_response_content = current_response_content
         except Exception as e:
@@ -3449,11 +3328,25 @@ class IdentifyAttributesBody(BaseModel):
     rag_results: dict
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _default_resource_path = "data/datasetRecursosBase.ndjson"
+    _default_schemas_path = "data/enriched_dataset_schemasBase.ndjson"
+    if os.path.exists(_default_resource_path) and os.path.exists(_default_schemas_path):
+        try:
+            _get_rag_index(_default_resource_path, _default_schemas_path, ["medico2"])
+            print("RAG index pre-warmed on startup.")
+        except Exception as e:
+            print(f"WARNING: RAG index pre-warm failed: {e}")
+    yield
+
+
 # --- FastAPI Application ---
 app = FastAPI(
-    title="Attribute Clustering, RAG & LLM Identification API", # Updated title
+    title="Attribute Clustering, RAG & LLM Identification API",
     description="Runs pipelines for clustering, resource retrieval (RAG), and LLM-based attribute identification.",
-    version="1.3.0", # Incremented version
+    version="1.3.0",
+    lifespan=lifespan,
 )
 
 # --- API Endpoints ---
